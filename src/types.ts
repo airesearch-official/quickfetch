@@ -6,6 +6,9 @@ export interface DownloadJob {
   title: string | null;
   status: JobStatus;
   progress: number | null;
+  downloaded_bytes: number | null;
+  total_bytes: number | null;
+  total_is_estimate: boolean;
   speed: string | null;
   eta: string | null;
   filename: string | null;
@@ -17,6 +20,7 @@ export interface Settings {
   download_dir: string;
   concurrency: number;
   open_folder_when_done: boolean;
+  cookies_file: string | null;
 }
 
 export interface DependencyInfo {
@@ -25,6 +29,8 @@ export interface DependencyInfo {
   ytdlp_managed: boolean;
   ffmpeg_path: string | null;
   ffmpeg_version: string | null;
+  ffprobe_path: string | null;
+  ffprobe_version: string | null;
 }
 
 export interface AppSnapshot {

@@ -7,11 +7,12 @@ import {
 } from "lucide-react";
 import type { AppSnapshot, DownloadJob, EnqueueResult, Settings } from "./types";
 import { parseUrlLines } from "./url-utils";
+import { progressText } from "./progress";
 
 const emptySnapshot: AppSnapshot = {
-  settings: { download_dir: "", concurrency: 3, open_folder_when_done: false },
+  settings: { download_dir: "", concurrency: 3, open_folder_when_done: false, cookies_file: null },
   jobs: [],
-  dependencies: { ytdlp_path: null, ytdlp_version: null, ytdlp_managed: false, ffmpeg_path: null, ffmpeg_version: null },
+  dependencies: { ytdlp_path: null, ytdlp_version: null, ytdlp_managed: false, ffmpeg_path: null, ffmpeg_version: null, ffprobe_path: null, ffprobe_version: null },
 };
 
 function statusLabel(status: DownloadJob["status"]) {
@@ -27,9 +28,18 @@ function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    invoke<AppSnapshot>("get_snapshot").then(setSnapshot).catch((error) => setNotice(String(error)));
-    listen<AppSnapshot>("snapshot", (event) => setSnapshot(event.payload)).then((fn) => { unlisten = fn; });
-    return () => unlisten?.();
+    let disposed = false;
+    let receivedEvent = false;
+    listen<AppSnapshot>("snapshot", (event) => {
+      receivedEvent = true;
+      if (!disposed) setSnapshot(event.payload);
+    }).then(async (fn) => {
+      if (disposed) { fn(); return; }
+      unlisten = fn;
+      const initial = await invoke<AppSnapshot>("get_snapshot");
+      if (!disposed && !receivedEvent) setSnapshot(initial);
+    }).catch((error) => { if (!disposed) setNotice(String(error)); });
+    return () => { disposed = true; unlisten?.(); };
   }, []);
 
   const counts = useMemo(() => snapshot.jobs.reduce((acc, job) => {
@@ -139,7 +149,7 @@ function JobRow({ job, run }: { job: DownloadJob; run: (command: string, args?: 
   const [details, setDetails] = useState(false);
   const active = ["starting", "downloading", "merging"].includes(job.status);
   const subtitle = job.status === "downloading"
-    ? [job.progress == null ? null : `${Math.round(job.progress)}%`, job.speed, job.eta ? `${job.eta} left` : null].filter(Boolean).join("  •  ")
+    ? progressText(job)
     : statusLabel(job.status);
   return <article className={`job job-${job.status}`}>
     <div className="job-top">
@@ -149,7 +159,7 @@ function JobRow({ job, run }: { job: DownloadJob; run: (command: string, args?: 
       </div>
       <span className="status-pill">{job.status === "completed" && <Check size={13} />}{active && <LoaderCircle className="spin" size={13} />}{statusLabel(job.status)}</span>
     </div>
-    {(active || job.progress != null) && <div className="progress-track"><div style={{ width: `${job.progress ?? (job.status === "merging" ? 100 : 3)}%` }} /></div>}
+    {(active || job.progress != null) && <div className="progress-track" role="progressbar" aria-label="Download progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={job.progress ?? undefined}><div style={{ width: `${job.progress ?? (job.status === "merging" ? 100 : 3)}%` }} /></div>}
     <div className="job-footer">
       <span>{subtitle}</span>
       <div className="job-actions">
@@ -189,8 +199,12 @@ function SettingsPanel({ snapshot, close, updateSettings, run, setNotice }: {
       </div>
       <div className="settings-group">
         <h3>Downloader</h3>
+        <label><span><strong>Authentication cookies</strong><small>{snapshot.settings.cookies_file ?? "No cookies selected"}</small></span><button onClick={() => run("choose_cookies_file")}>Choose cookies.txt</button></label>
+        <p>Use a Netscape-format cookies export from your signed-in browser. Cookies grant access to your account; keep the file private. Authentication may help with bot checks, but does not guarantee relief from rate limits.</p>
+        {snapshot.settings.cookies_file && <button onClick={() => updateSettings({ cookies_file: null })}>Stop using cookies</button>}
         <DependencyRow name="yt-dlp" available={!!snapshot.dependencies.ytdlp_path} detail={snapshot.dependencies.ytdlp_version ? `${snapshot.dependencies.ytdlp_version}${snapshot.dependencies.ytdlp_managed ? " • managed by QuickFetch" : " • system"}` : "Not found"} />
         <DependencyRow name="FFmpeg" available={!!snapshot.dependencies.ffmpeg_path} detail={snapshot.dependencies.ffmpeg_version ?? "Not found — required to merge audio and video"} />
+        <DependencyRow name="FFprobe" available={!!snapshot.dependencies.ffprobe_path} detail={snapshot.dependencies.ffprobe_version ?? "Not found — required to validate output media"} />
         <div className="settings-buttons">
           <button onClick={updateYtdlp} disabled={updating}>{updating && <LoaderCircle className="spin" size={14} />}{snapshot.dependencies.ytdlp_path ? "Check yt-dlp update" : "Install yt-dlp"}</button>
           {!snapshot.dependencies.ffmpeg_path && <button onClick={() => run("open_ffmpeg_help")}><ExternalLink size={14} /> Get FFmpeg</button>}
