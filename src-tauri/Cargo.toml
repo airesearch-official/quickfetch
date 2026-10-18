@@ -1,0 +1,33 @@
+[package]
+name = "quickfetch"
+version = "0.1.0"
+description = "A focused, lightweight yt-dlp desktop downloader"
+authors = ["QuickFetch"]
+edition = "2021"
+
+[lib]
+name = "quickfetch_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2.4"
+tauri-plugin-opener = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "fs", "macros", "rt-multi-thread"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
