@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-22
 
 ### Added
 
@@ -19,6 +19,8 @@
 - Settings and queue saves replace files atomically. Tool updates hold the queue until replacement finishes.
 - Setup actions report progress and errors inside Settings.
 - The webview has a restricted content security policy.
+
+[Release and downloads](https://github.com/airesearch-official/quickfetch/releases/tag/v0.1.1)
 
 ## 0.1.0 — 2026-10-18
 

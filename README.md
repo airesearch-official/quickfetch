@@ -14,7 +14,7 @@ The screenshots show v0.1.1 with generated demo media and sample settings. Check
 
 ## Why QuickFetch?
 
-- **A small desktop app.** The published v0.1.0 Windows installer is approximately 1.9 MB. WebView2 and downloader tools are separate dependencies.
+- **A small desktop app.** The v0.1.1 Windows installer is approximately 1.9 MB. WebView2 and downloader tools are separate dependencies.
 - **Multiple links, one queue.** Paste one URL per line. Run up to five downloads at once, with three enabled by default.
 - **Visible progress.** Follow percentage, downloaded size, total size, speed, and remaining time. Cancel or retry individual jobs.
 - **Video with audio.** Prefer WebM streams up to 1080p. If merging fails, QuickFetch tries a lossless stream-copy recovery into MKV.
@@ -69,7 +69,7 @@ Use QuickFetch for media you own or have permission to download. Site availabili
 To check an installer in PowerShell, run the following command and compare its hash with the corresponding entry in `SHA256SUMS.txt` from the same release.
 
 ```powershell
-Get-FileHash .\QuickFetch_0.1.0_x64-setup.exe -Algorithm SHA256
+Get-FileHash .\QuickFetch_0.1.1_x64-setup.exe -Algorithm SHA256
 ```
 
 Checksums detect changed bytes. The app packages currently have no code-signing certificate or independent security certification.
