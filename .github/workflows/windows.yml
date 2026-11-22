@@ -1,0 +1,63 @@
+name: Windows checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Check frontend
+        run: |
+          npm run typecheck
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm run lint
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm test
+      - name: Check Rust
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build the NSIS installer
+        run: .\node_modules\.bin\tauri.cmd build --bundles nsis
+      - name: Install and launch QuickFetch
+        run: |
+          $installer = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Installer not found' }
+          $destination = Join-Path $env:RUNNER_TEMP QuickFetchSmoke
+          # NSIS requires /D to be last, with no quotes around its value.
+          $setup = Start-Process -FilePath $installer.FullName -ArgumentList "/S /D=$destination" -WindowStyle Hidden -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Installer exited with $($setup.ExitCode)" }
+          $exe = Join-Path $destination quickfetch.exe
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'Installed executable not found' }
+          $app = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "QuickFetch exited with $($app.ExitCode)" }
+              if ($app.MainWindowTitle -eq 'QuickFetch' -and $app.Responding) {
+                $ready = $true
+                break
+              }
+            }
+            if (-not $ready) { throw 'QuickFetch window did not respond' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id }
+          }

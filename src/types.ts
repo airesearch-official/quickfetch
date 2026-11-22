@@ -1,4 +1,4 @@
-export type JobStatus = "waiting" | "starting" | "downloading" | "merging" | "completed" | "failed" | "cancelled";
+export type JobStatus = "waiting" | "interrupted" | "starting" | "downloading" | "merging" | "completed" | "failed" | "cancelled";
 
 export interface DownloadJob {
   id: string;
@@ -13,7 +13,7 @@ export interface DownloadJob {
   eta: string | null;
   filename: string | null;
   error: string | null;
-  details: string;
+  has_details: boolean;
 }
 
 export interface Settings {
@@ -31,6 +31,8 @@ export interface DependencyInfo {
   ffmpeg_version: string | null;
   ffprobe_path: string | null;
   ffprobe_version: string | null;
+  deno_path?: string | null;
+  deno_version?: string | null;
 }
 
 export interface AppSnapshot {

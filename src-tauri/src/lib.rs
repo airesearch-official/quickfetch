@@ -1,4 +1,8 @@
+mod process_tree;
+
+use process_tree::ProcessTree;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, VecDeque},
     fs::OpenOptions,
@@ -44,12 +48,15 @@ struct DependencyInfo {
     ffmpeg_version: Option<String>,
     ffprobe_path: Option<String>,
     ffprobe_version: Option<String>,
+    deno_path: Option<String>,
+    deno_version: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum JobStatus {
     Waiting,
+    Interrupted,
     Starting,
     Downloading,
     Merging,
@@ -71,10 +78,24 @@ struct DownloadJob {
     speed: Option<String>,
     eta: Option<String>,
     filename: Option<String>,
+    #[serde(default)]
+    download_dir: Option<String>,
     #[serde(skip)]
     merge_inputs: Vec<String>,
     error: Option<String>,
+    #[serde(
+        rename = "has_details",
+        skip_deserializing,
+        serialize_with = "serialize_log_presence"
+    )]
     details: String,
+}
+
+fn serialize_log_presence<S: serde::Serializer>(
+    details: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(!details.is_empty())
 }
 
 #[derive(Clone, Serialize)]
@@ -98,6 +119,7 @@ struct Inner {
     active: usize,
     cancellations: HashMap<String, CancellationToken>,
     dependencies: DependencyInfo,
+    updating_tool: bool,
 }
 
 #[derive(Clone)]
@@ -132,9 +154,50 @@ fn load_settings(config_dir: &Path) -> Settings {
 }
 
 fn persist_settings(shared: &Shared, settings: &Settings) -> Result<(), String> {
-    std::fs::create_dir_all(&shared.config_dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
-    std::fs::write(shared.config_dir.join("settings.json"), json).map_err(|e| e.to_string())
+    let json = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    write_config_file(&shared.config_dir, "settings.json", &json)
+}
+
+fn load_queue(config_dir: &Path) -> Vec<DownloadJob> {
+    let Ok(bytes) = std::fs::read(config_dir.join("queue.json")) else {
+        return Vec::new();
+    };
+    let Ok(mut jobs) = serde_json::from_slice::<Vec<DownloadJob>>(&bytes) else {
+        return Vec::new();
+    };
+    for job in &mut jobs {
+        if matches!(
+            job.status,
+            JobStatus::Waiting | JobStatus::Starting | JobStatus::Downloading | JobStatus::Merging
+        ) {
+            job.status = JobStatus::Interrupted;
+            job.progress = None;
+            job.downloaded_bytes = None;
+            job.total_bytes = None;
+            job.total_is_estimate = false;
+            job.speed = None;
+            job.eta = None;
+            job.error = None;
+        }
+    }
+    jobs
+}
+
+fn persist_queue(config_dir: &Path, jobs: &[DownloadJob]) -> Result<(), String> {
+    let bytes = serde_json::to_vec(jobs).map_err(|error| error.to_string())?;
+    write_config_file(config_dir, "queue.json", &bytes)
+}
+
+fn write_config_file(config_dir: &Path, filename: &str, bytes: &[u8]) -> Result<(), String> {
+    std::fs::create_dir_all(config_dir).map_err(|error| error.to_string())?;
+    let staging = config_dir.join(format!("{filename}-{}.tmp", uuid::Uuid::new_v4()));
+    let result = std::fs::write(&staging, bytes)
+        .and_then(|()| std::fs::rename(&staging, config_dir.join(filename)));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(staging);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn log_line(shared: &Shared, message: &str) {
@@ -169,24 +232,15 @@ fn hidden_tokio(command: &mut Command) {
 fn hidden_tokio(_: &mut Command) {}
 
 fn find_on_path(executable: &str) -> Option<PathBuf> {
-    let mut command = if cfg!(windows) {
-        let mut value = StdCommand::new("where.exe");
-        value.arg(executable);
-        value
+    let name = if cfg!(windows) {
+        format!("{executable}.exe")
     } else {
-        let mut value = StdCommand::new("which");
-        value.arg(executable);
-        value
+        executable.to_owned()
     };
-    hidden_std(&mut command);
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.lines().next().map(str::trim).map(PathBuf::from))
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(&name))
+        .find(|path| path.is_file())
 }
 
 fn command_version(path: &Path, arg: &str) -> Option<String> {
@@ -220,24 +274,24 @@ fn detect_dependencies(data_dir: &Path) -> DependencyInfo {
     } else {
         "yt-dlp"
     });
-    let ytdlp_path = managed_ytdlp
-        .exists()
-        .then_some(managed_ytdlp.clone())
-        .or_else(|| find_on_path("yt-dlp"));
+    let ytdlp = Some(managed_ytdlp.clone())
+        .into_iter()
+        .chain(find_on_path("yt-dlp"))
+        .filter(|path| path.is_file())
+        .find_map(|path| command_version(&path, "--version").map(|version| (path, version)));
     let managed_ffmpeg = data_dir.join("bin").join(if cfg!(windows) {
         "ffmpeg.exe"
     } else {
         "ffmpeg"
     });
-    let ffmpeg_path = managed_ffmpeg
-        .exists()
-        .then_some(managed_ffmpeg)
-        .or_else(|| find_on_path("ffmpeg"))
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| command_version(path, "-version").is_some());
-    let ffprobe_path = ffmpeg_path
+    let ffmpeg = Some(managed_ffmpeg)
+        .into_iter()
+        .chain(find_on_path("ffmpeg"))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find_map(|path| command_version(&path, "-version").map(|version| (path, version)));
+    let ffprobe = ffmpeg
         .as_ref()
-        .and_then(|path| path.parent())
+        .and_then(|(path, _)| path.parent())
         .map(|path| {
             path.join(if cfg!(windows) {
                 "ffprobe.exe"
@@ -245,24 +299,37 @@ fn detect_dependencies(data_dir: &Path) -> DependencyInfo {
                 "ffprobe"
             })
         })
-        .filter(|path| path.is_file())
-        .or_else(|| find_on_path("ffprobe"))
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .filter(|path| command_version(path, "-version").is_some());
+        .into_iter()
+        .chain(find_on_path("ffprobe"))
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find_map(|path| command_version(&path, "-version").map(|version| (path, version)));
+    let deno = find_on_path("deno").and_then(|path| {
+        let version = command_version(&path, "--version")?;
+        let mut parts = version.split_whitespace().nth(1)?.split('.');
+        let major = parts.next()?.parse::<u32>().ok()?;
+        let minor = parts.next()?.parse::<u32>().ok()?;
+        ((major, minor) >= (2, 3)).then_some((path, version))
+    });
     DependencyInfo {
-        ytdlp_version: ytdlp_path
-            .as_deref()
-            .and_then(|path| command_version(path, "--version")),
-        ytdlp_managed: ytdlp_path.as_ref() == Some(&managed_ytdlp),
-        ytdlp_path: ytdlp_path.map(|p| p.to_string_lossy().to_string()),
-        ffmpeg_version: ffmpeg_path
-            .as_deref()
-            .and_then(|path| command_version(path, "-version")),
-        ffmpeg_path: ffmpeg_path.map(|p| p.to_string_lossy().to_string()),
-        ffprobe_version: ffprobe_path
-            .as_deref()
-            .and_then(|path| command_version(path, "-version")),
-        ffprobe_path: ffprobe_path.map(|p| p.to_string_lossy().to_string()),
+        ytdlp_managed: ytdlp
+            .as_ref()
+            .is_some_and(|(path, _)| path == &managed_ytdlp),
+        ytdlp_path: ytdlp
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        ytdlp_version: ytdlp.map(|(_, version)| version),
+        ffmpeg_path: ffmpeg
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        ffmpeg_version: ffmpeg.map(|(_, version)| version),
+        ffprobe_path: ffprobe
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        ffprobe_version: ffprobe.map(|(_, version)| version),
+        deno_path: deno
+            .as_ref()
+            .map(|(path, _)| path.to_string_lossy().into_owned()),
+        deno_version: deno.map(|(_, version)| version),
     }
 }
 
@@ -294,12 +361,33 @@ impl SnapshotSink for Option<AppHandle> {
 }
 
 async fn emit_snapshot(shared: &Shared, app: &impl SnapshotSink) {
-    app.send(snapshot(shared).await);
+    let inner = shared.inner.lock().await;
+    if let Err(error) = persist_queue(&shared.config_dir, &inner.jobs) {
+        log_line(shared, &format!("Could not save download queue: {error}"));
+    }
+    app.send(AppSnapshot {
+        settings: inner.settings.clone(),
+        jobs: inner.jobs.clone(),
+        dependencies: inner.dependencies.clone(),
+    });
 }
 
 #[tauri::command]
 async fn get_snapshot(state: State<'_, Shared>) -> Result<AppSnapshot, String> {
     Ok(snapshot(&state).await)
+}
+
+#[tauri::command]
+async fn get_job_details(id: String, state: State<'_, Shared>) -> Result<String, String> {
+    state
+        .inner
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|job| job.id == id)
+        .map(|job| job.details.clone())
+        .ok_or_else(|| "Download not found".into())
 }
 
 #[tauri::command]
@@ -344,6 +432,7 @@ async fn enqueue_urls(
                     speed: None,
                     eta: None,
                     filename: None,
+                    download_dir: None,
                     merge_inputs: Vec::new(),
                     error: None,
                     details: String::new(),
@@ -379,8 +468,11 @@ async fn update_settings(
             return Err("The selected cookies file no longer exists. Choose it again.".into());
         }
     }
-    persist_settings(&shared, &safe)?;
-    shared.inner.lock().await.settings = safe;
+    {
+        let mut inner = shared.inner.lock().await;
+        persist_settings(&shared, &safe)?;
+        inner.settings = safe;
+    }
     emit_snapshot(&shared, &app).await;
     pump(shared, Some(app));
     Ok(())
@@ -416,10 +508,12 @@ async fn choose_download_folder(state: State<'_, Shared>, app: AppHandle) -> Res
         .set_directory(current)
         .blocking_pick_folder();
     if let Some(path) = selection.and_then(|value| value.into_path().ok()) {
-        let mut settings = shared.inner.lock().await.settings.clone();
+        let mut inner = shared.inner.lock().await;
+        let mut settings = inner.settings.clone();
         settings.download_dir = path.to_string_lossy().to_string();
         persist_settings(&shared, &settings)?;
-        shared.inner.lock().await.settings = settings;
+        inner.settings = settings;
+        drop(inner);
         emit_snapshot(&shared, &app).await;
     }
     Ok(())
@@ -434,10 +528,43 @@ async fn open_download_folder(state: State<'_, Shared>, app: AppHandle) -> Resul
 }
 
 #[tauri::command]
+async fn reveal_download(
+    id: String,
+    state: State<'_, Shared>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let path = state
+        .inner
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|job| job.id == id && job.status == JobStatus::Completed)
+        .and_then(|job| job.filename.clone())
+        .ok_or("No completed file is available for this download.")?;
+    if !Path::new(&path).is_file() {
+        return Err("The downloaded file has been moved or deleted.".into());
+    }
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn open_ffmpeg_help(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_url("https://ffmpeg.org/download.html", None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_deno_help(app: AppHandle) -> Result<(), String> {
+    app.opener()
+        .open_url(
+            "https://docs.deno.com/runtime/getting_started/installation/",
+            None::<&str>,
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -467,8 +594,13 @@ async fn retry_job(id: String, state: State<'_, Shared>, app: AppHandle) -> Resu
             .iter_mut()
             .find(|job| job.id == id)
             .ok_or("Download not found")?;
-        if !matches!(job.status, JobStatus::Failed | JobStatus::Cancelled) {
-            return Err("Only failed or cancelled downloads can be retried.".into());
+        if !matches!(
+            job.status,
+            JobStatus::Failed | JobStatus::Cancelled | JobStatus::Interrupted
+        ) {
+            return Err(
+                "Only failed, cancelled, or interrupted downloads can be restarted.".into(),
+            );
         }
         job.status = JobStatus::Waiting;
         job.progress = None;
@@ -527,49 +659,108 @@ async fn clear_finished(state: State<'_, Shared>, app: AppHandle) -> Result<(), 
 #[tauri::command]
 async fn update_ytdlp(state: State<'_, Shared>, app: AppHandle) -> Result<String, String> {
     let shared = state.inner().clone();
-    let dependency = shared.inner.lock().await.dependencies.clone();
-    let message = if let Some(path) = dependency.ytdlp_path {
-        let mut command = Command::new(&path);
-        command
-            .arg("--update-to")
-            .arg("stable")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        hidden_tokio(&mut command);
-        let output = command
-            .output()
-            .await
-            .map_err(|e| format!("Could not start yt-dlp update: {e}"))?;
-        let text = String::from_utf8_lossy(if output.stdout.is_empty() {
-            &output.stderr
-        } else {
-            &output.stdout
-        })
-        .trim()
-        .to_string();
-        if !output.status.success() {
-            return Err(if text.is_empty() {
-                "yt-dlp update failed.".into()
-            } else {
-                text
-            });
+    static UPDATE_LOCK: Mutex<()> = Mutex::const_new(());
+    let _update = UPDATE_LOCK
+        .try_lock()
+        .map_err(|_| "A yt-dlp update is already running.")?;
+    {
+        let mut inner = shared.inner.lock().await;
+        if inner.active > 0 {
+            return Err("Wait for active downloads to finish before updating yt-dlp.".into());
         }
-        if text.is_empty() {
-            "yt-dlp is up to date.".into()
-        } else {
-            text
-        }
-    } else {
-        install_managed_ytdlp(&shared).await?;
-        "yt-dlp was installed and is ready.".into()
-    };
-    let dependencies = detect_dependencies(&shared.data_dir);
-    shared.inner.lock().await.dependencies = dependencies;
-    emit_snapshot(&shared, &app).await;
-    Ok(message)
+        inner.updating_tool = true;
+    }
+    let result = async {
+        let version = install_managed_ytdlp(&shared).await?;
+        refresh_dependencies(&shared, &app).await?;
+        Ok(format!("Managed yt-dlp {version} is ready."))
+    }
+    .await;
+    shared.inner.lock().await.updating_tool = false;
+    pump(shared, Some(app));
+    result
 }
 
-async fn install_managed_ytdlp(shared: &Shared) -> Result<(), String> {
+#[tauri::command]
+async fn check_setup(state: State<'_, Shared>, app: AppHandle) -> Result<(), String> {
+    refresh_dependencies(state.inner(), &app).await
+}
+
+async fn refresh_dependencies(shared: &Shared, app: &AppHandle) -> Result<(), String> {
+    let directory = shared.data_dir.clone();
+    let dependencies =
+        tauri::async_runtime::spawn_blocking(move || detect_dependencies(&directory))
+            .await
+            .map_err(|error| error.to_string())?;
+    shared.inner.lock().await.dependencies = dependencies;
+    emit_snapshot(shared, app).await;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct YtdlpRelease {
+    tag_name: String,
+}
+
+fn verify_ytdlp_checksum(checksums: &str, bytes: &[u8]) -> Result<(), String> {
+    let expected = checksums
+        .lines()
+        .find_map(|line| {
+            let (hash, filename) = line.split_once(char::is_whitespace)?;
+            (filename.trim().trim_start_matches('*') == "yt-dlp.exe").then_some(hash)
+        })
+        .ok_or("The yt-dlp release checksum is missing.")?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err("The yt-dlp download did not match its published SHA-256 checksum.".into());
+    }
+    Ok(())
+}
+
+async fn fetch_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        match fetch_bounded_once(client, url, limit).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => last_error = error,
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+        }
+    }
+    Err(last_error)
+}
+
+async fn fetch_bounded_once(
+    client: &reqwest::Client,
+    url: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| format!("Could not download the yt-dlp release: {error}"))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("Could not read {url}: {error:?}"))?
+    {
+        if chunk.len() > limit - bytes.len() {
+            return Err("The yt-dlp release file exceeds the download limit.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn install_managed_ytdlp(shared: &Shared) -> Result<String, String> {
     if !cfg!(windows) {
         return Err("Automatic yt-dlp setup is currently available in the Windows build.".into());
     }
@@ -577,37 +768,52 @@ async fn install_managed_ytdlp(shared: &Shared) -> Result<(), String> {
     tokio::fs::create_dir_all(&bin_dir)
         .await
         .map_err(|e| e.to_string())?;
-    let response =
-        reqwest::get("https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe")
-            .await
-            .map_err(|e| format!("Could not reach the official yt-dlp release: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "The official yt-dlp download returned HTTP {}.",
-            response.status()
-        ));
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .user_agent("QuickFetch")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let metadata = fetch_bounded(
+        &client,
+        "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+        512 * 1024,
+    )
+    .await?;
+    let release: YtdlpRelease =
+        serde_json::from_slice(&metadata).map_err(|error| error.to_string())?;
+    let version = release.tag_name;
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return Err("Unexpected stable yt-dlp release version.".into());
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    if bytes.len() < 1_000_000 {
-        return Err("The yt-dlp download did not look like a valid executable.".into());
-    }
-    let temporary = bin_dir.join("yt-dlp.download");
     let destination = bin_dir.join("yt-dlp.exe");
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|e| e.to_string())?;
-    if destination.exists() {
-        tokio::fs::remove_file(&destination)
-            .await
-            .map_err(|e| e.to_string())?;
+    let base = format!("https://github.com/yt-dlp/yt-dlp/releases/download/{version}");
+    let checksum_bytes = fetch_bounded(&client, &format!("{base}/SHA2-256SUMS"), 64 * 1024).await?;
+    let checksums = std::str::from_utf8(&checksum_bytes).map_err(|error| error.to_string())?;
+    let bytes = fetch_bounded(&client, &format!("{base}/yt-dlp.exe"), 64 * 1024 * 1024).await?;
+    verify_ytdlp_checksum(checksums, &bytes)?;
+    let temporary = bin_dir.join(format!("yt-dlp-{}.download", uuid::Uuid::new_v4()));
+    let result = async {
+        tokio::fs::write(&temporary, bytes).await?;
+        // Replace in one operation so a failed rename leaves the existing binary in place.
+        tokio::fs::rename(&temporary, destination).await
     }
-    tokio::fs::rename(temporary, destination)
-        .await
-        .map_err(|e| e.to_string())
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(format!("Could not install managed yt-dlp: {error}"));
+    }
+    Ok(version)
 }
 
 fn take_next(inner: &mut Inner) -> Option<(String, CancellationToken)> {
-    if inner.active >= inner.settings.concurrency {
+    if inner.updating_tool || inner.active >= inner.settings.concurrency {
         return None;
     }
     inner.queue.pop_front().map(|id| {
@@ -616,6 +822,8 @@ fn take_next(inner: &mut Inner) -> Option<(String, CancellationToken)> {
         inner.cancellations.insert(id.clone(), token.clone());
         if let Some(job) = inner.jobs.iter_mut().find(|job| job.id == id) {
             job.status = JobStatus::Starting;
+            job.download_dir
+                .get_or_insert_with(|| inner.settings.download_dir.clone());
         }
         (id, token)
     })
@@ -670,7 +878,9 @@ async fn run_job(
         inner.jobs.iter().find(|job| job.id == id).map(|job| {
             (
                 job.url.clone(),
-                inner.settings.download_dir.clone(),
+                job.download_dir
+                    .clone()
+                    .unwrap_or_else(|| inner.settings.download_dir.clone()),
                 inner.dependencies.clone(),
                 inner.settings.cookies_file.clone(),
             )
@@ -705,6 +915,9 @@ async fn run_job(
     if let Some(path) = cookies_file {
         command.arg("--cookies").arg(path);
     }
+    if let Some(path) = dependencies.deno_path.as_deref() {
+        command.arg("--js-runtimes").arg(format!("deno:{path}"));
+    }
     command
         .arg("--ignore-config")
         .arg("--no-playlist")
@@ -735,11 +948,12 @@ async fn run_job(
         command.arg("--ffmpeg-location").arg(ffmpeg);
     }
     command
+        .arg("--")
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hidden_tokio(&mut command);
-    let mut child = match command.spawn() {
+    let (mut child, tree) = match ProcessTree::spawn(&mut command) {
         Ok(child) => child,
         Err(error) => {
             fail_job(
@@ -781,14 +995,13 @@ async fn run_job(
             None
         }
     };
+    drop(tree);
     let _ = stdout_task.await;
     let _ = stderr_task.await;
-    if cancellation.is_cancelled() || outcome.is_none() {
-        log_line(&shared, &format!("cancelled job {id}"));
-    } else {
+    if let Some(outcome) = outcome.filter(|_| !cancellation.is_cancelled()) {
         // Drain both pipes before deciding the terminal state: progress and errors
         // can still be buffered after the child has exited.
-        let failure = match outcome.unwrap() {
+        let failure = match outcome {
             Ok(status) if status.success() => None,
             Ok(status) => Some(format!("Download failed (yt-dlp exited with {status}).")),
             Err(error) => Some(format!("Could not wait for yt-dlp: {error}")),
@@ -804,7 +1017,7 @@ async fn run_job(
         let mut valid_media = if let (Some(filename), Some(ffprobe)) =
             (filename.as_deref(), dependencies.ffprobe_path.as_deref())
         {
-            validate_media(ffprobe, &filename).await
+            validate_media(ffprobe, filename).await
         } else {
             false
         };
@@ -929,8 +1142,7 @@ async fn recover_merge(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     hidden_tokio(&mut command);
-    let child = command
-        .spawn()
+    let (child, _tree) = ProcessTree::spawn(&mut command)
         .map_err(|e| format!("Could not start MKV recovery: {e}"))?;
     let pid = child.id();
     let result = tokio::select! {
@@ -967,8 +1179,11 @@ async fn validate_media(ffprobe: &str, filename: &str) -> bool {
         .stderr(Stdio::null())
         .kill_on_drop(true);
     hidden_tokio(&mut command);
+    let Ok((child, _tree)) = ProcessTree::spawn(&mut command) else {
+        return false;
+    };
     let Ok(Ok(output)) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), command.output()).await
+        tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output()).await
     else {
         return false;
     };
@@ -1019,16 +1234,23 @@ async fn read_output<R: tokio::io::AsyncRead + Unpin>(
 ) {
     let mut lines = BufReader::new(stream).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        apply_output_line(&id, &line, &shared).await;
-        emit_snapshot(&shared, &app).await;
+        if apply_output_line(&id, &line, &shared).await {
+            if let Some(app) = &app {
+                let inner = shared.inner.lock().await;
+                if let Some(job) = inner.jobs.iter().find(|job| job.id == id) {
+                    let _ = app.emit("job-update", job);
+                }
+            }
+        }
     }
 }
 
-async fn apply_output_line(id: &str, line: &str, shared: &Shared) {
+async fn apply_output_line(id: &str, line: &str, shared: &Shared) -> bool {
     let mut inner = shared.inner.lock().await;
     let Some(job) = inner.jobs.iter_mut().find(|job| job.id == id) else {
-        return;
+        return false;
     };
+    let first_log = job.details.is_empty();
     if job.details.len() < 24_000 {
         job.details.push_str(line);
         job.details.push('\n');
@@ -1037,11 +1259,11 @@ async fn apply_output_line(id: &str, line: &str, shared: &Shared) {
         job.status,
         JobStatus::Cancelled | JobStatus::Completed | JobStatus::Failed
     ) {
-        return;
+        return false;
     }
     if let Some(data) = line.strip_prefix("__QF_PROGRESS_JSON__") {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            return;
+            return first_log;
         };
         job.status = JobStatus::Downloading;
         job.progress = value["percent"].as_str().and_then(parse_percent);
@@ -1053,7 +1275,7 @@ async fn apply_output_line(id: &str, line: &str, shared: &Shared) {
         job.total_is_estimate = exact.is_none() && job.total_bytes.is_some();
     } else if let Some(data) = line.strip_prefix("__QF_MERGE_JSON__") {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            return;
+            return first_log;
         };
         job.merge_inputs = value["inputs"]
             .as_array()
@@ -1070,7 +1292,7 @@ async fn apply_output_line(id: &str, line: &str, shared: &Shared) {
         job.status = JobStatus::Merging;
     } else if let Some(data) = line.strip_prefix("__QF_META_JSON__") {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-            return;
+            return first_log;
         };
         job.title = value["title"].as_str().map(str::to_owned);
         job.filename = value["filename"].as_str().map(str::to_owned);
@@ -1084,7 +1306,10 @@ async fn apply_output_line(id: &str, line: &str, shared: &Shared) {
         job.progress = Some(100.0);
     } else if line.starts_with("ERROR:") {
         job.error = Some(human_error(line));
+    } else {
+        return first_log;
     }
+    true
 }
 
 fn parse_percent(value: &str) -> Option<f64> {
@@ -1162,9 +1387,135 @@ async fn finish_slot(id: String, shared: Shared, app: Option<AppHandle>) {
     }
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let config_dir = app.path().app_config_dir()?;
+            let data_dir = app.path().app_local_data_dir()?;
+            let settings = load_settings(&config_dir);
+            let jobs = load_queue(&config_dir);
+            let dependencies = detect_dependencies(&data_dir);
+            let shared = Shared {
+                inner: Arc::new(Mutex::new(Inner {
+                    settings,
+                    jobs,
+                    queue: VecDeque::new(),
+                    active: 0,
+                    cancellations: HashMap::new(),
+                    dependencies: dependencies.clone(),
+                    updating_tool: false,
+                })),
+                config_dir,
+                data_dir,
+            };
+            log_line(
+                &shared,
+                &format!(
+                    "QuickFetch 0.1.1 started; yt-dlp={:?}; ffmpeg={:?}",
+                    dependencies.ytdlp_version, dependencies.ffmpeg_version
+                ),
+            );
+            app.manage(shared);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            get_job_details,
+            enqueue_urls,
+            update_settings,
+            choose_download_folder,
+            choose_cookies_file,
+            open_download_folder,
+            reveal_download,
+            open_ffmpeg_help,
+            open_deno_help,
+            cancel_job,
+            retry_job,
+            remove_job,
+            clear_finished,
+            update_ytdlp,
+            check_setup,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running QuickFetch");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_checksum_for_the_exact_windows_asset() {
+        let hash = format!("{:x}", Sha256::digest(b"expected binary"));
+        let checksums = format!("{hash}  yt-dlp_x86.exe\n{hash} *yt-dlp.exe\n");
+        assert!(verify_ytdlp_checksum(&checksums, b"expected binary").is_ok());
+        assert!(verify_ytdlp_checksum(&checksums, b"modified binary").is_err());
+        assert!(
+            verify_ytdlp_checksum(&format!("{hash}  yt-dlp_x86.exe"), b"expected binary").is_err()
+        );
+    }
+
+    #[test]
+    fn progress_payloads_exclude_diagnostic_text_and_merge_inputs() {
+        let mut inner = test_inner(1, 1);
+        let job = &mut inner.jobs[0];
+        job.details = "private diagnostic content".repeat(1000);
+        job.merge_inputs = vec!["C:/temporary/video.webm".into()];
+        let payload = serde_json::to_string(job).unwrap();
+        assert!(payload.contains("\"has_details\":true"));
+        assert!(!payload.contains("private diagnostic"));
+        assert!(!payload.contains("merge_inputs"));
+        assert!(payload.len() < 1000);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "downloads the current yt-dlp release from GitHub"]
+    async fn installs_verified_upstream_ytdlp() {
+        let directory =
+            std::env::temp_dir().join(format!("quickfetch-install-{}", uuid::Uuid::new_v4()));
+        let shared = Shared {
+            inner: Arc::new(Mutex::new(test_inner(1, 0))),
+            config_dir: directory.clone(),
+            data_dir: directory.clone(),
+        };
+        let result = install_managed_ytdlp(&shared).await;
+        let binary = directory.join("bin/yt-dlp.exe");
+        let detected_version = command_version(&binary, "--version");
+        if directory.is_dir() {
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+        assert_eq!(detected_version, Some(result.unwrap()));
+    }
+
+    #[test]
+    fn restores_active_jobs_without_restarting_and_retains_completed_files() {
+        let directory =
+            std::env::temp_dir().join(format!("quickfetch-queue-{}", uuid::Uuid::new_v4()));
+        let mut inner = test_inner(2, 2);
+        inner.jobs[0].status = JobStatus::Downloading;
+        inner.jobs[0].progress = Some(42.0);
+        inner.jobs[0].download_dir = Some("C:/Original".into());
+        inner.jobs[0].details = "temporary diagnostics".into();
+        inner.jobs[1].status = JobStatus::Completed;
+        inner.jobs[1].filename = Some("C:/Original/output.mkv".into());
+        persist_queue(&directory, &inner.jobs).unwrap();
+        persist_queue(&directory, &inner.jobs).unwrap();
+        let restored = load_queue(&directory);
+        assert!(restored[0].status == JobStatus::Interrupted);
+        assert_eq!(restored[0].progress, None);
+        assert_eq!(restored[0].download_dir.as_deref(), Some("C:/Original"));
+        assert!(restored[0].details.is_empty());
+        assert!(restored[1].status == JobStatus::Completed);
+        assert_eq!(
+            restored[1].filename.as_deref(),
+            Some("C:/Original/output.mkv")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     #[ignore = "requires Rust compiler, FFmpeg and FFprobe"]
@@ -1395,7 +1746,7 @@ mod tests {
                 .details
                 .lines()
                 .filter_map(|line| line.strip_prefix("__QF_PROGRESS_JSON__"))
-                .last()
+                .next_back()
                 .unwrap();
             let terminal: serde_json::Value = serde_json::from_str(last_progress).unwrap();
             assert_eq!(job.downloaded_bytes, byte_count(&terminal["downloaded"]));
@@ -1567,6 +1918,7 @@ mod tests {
                 speed: None,
                 eta: None,
                 filename: None,
+                download_dir: None,
                 merge_inputs: Vec::new(),
                 error: None,
                 details: String::new(),
@@ -1579,6 +1931,7 @@ mod tests {
             active: 0,
             cancellations: HashMap::new(),
             dependencies: DependencyInfo::default(),
+            updating_tool: false,
         }
     }
 
@@ -1704,54 +2057,4 @@ mod tests {
         let status = child.wait().await.unwrap();
         assert!(!status.success());
     }
-}
-
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let config_dir = app.path().app_config_dir()?;
-            let data_dir = app.path().app_local_data_dir()?;
-            let settings = load_settings(&config_dir);
-            let dependencies = detect_dependencies(&data_dir);
-            let shared = Shared {
-                inner: Arc::new(Mutex::new(Inner {
-                    settings,
-                    jobs: Vec::new(),
-                    queue: VecDeque::new(),
-                    active: 0,
-                    cancellations: HashMap::new(),
-                    dependencies: dependencies.clone(),
-                })),
-                config_dir,
-                data_dir,
-            };
-            log_line(
-                &shared,
-                &format!(
-                    "QuickFetch 0.1.0 started; yt-dlp={:?}; ffmpeg={:?}",
-                    dependencies.ytdlp_version, dependencies.ffmpeg_version
-                ),
-            );
-            app.manage(shared);
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_snapshot,
-            enqueue_urls,
-            update_settings,
-            choose_download_folder,
-            choose_cookies_file,
-            open_download_folder,
-            open_ffmpeg_help,
-            cancel_job,
-            retry_job,
-            remove_job,
-            clear_finished,
-            update_ytdlp,
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running QuickFetch");
 }

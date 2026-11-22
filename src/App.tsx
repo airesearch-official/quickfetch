@@ -16,6 +16,7 @@ const emptySnapshot: AppSnapshot = {
 };
 
 function statusLabel(status: DownloadJob["status"]) {
+  if (status === "interrupted") return "Ready to resume";
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
@@ -27,19 +28,28 @@ function App() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    const unsubscribers: (() => void)[] = [];
     let disposed = false;
     let receivedEvent = false;
-    listen<AppSnapshot>("snapshot", (event) => {
+    function subscribe<T>(name: string, handler: (payload: T) => void) {
+      return listen<T>(name, (event) => { if (!disposed) handler(event.payload); }).then((fn) => {
+        if (disposed) fn();
+        else unsubscribers.push(fn);
+      });
+    }
+    const snapshotListener = subscribe<AppSnapshot>("snapshot", (next) => {
       receivedEvent = true;
-      if (!disposed) setSnapshot(event.payload);
-    }).then(async (fn) => {
-      if (disposed) { fn(); return; }
-      unlisten = fn;
+      setSnapshot(next);
+    });
+    const jobListener = subscribe<DownloadJob>("job-update", (job) => {
+      setSnapshot((previous) => ({ ...previous, jobs: previous.jobs.map((item) => item.id === job.id ? job : item) }));
+    });
+    Promise.all([snapshotListener, jobListener]).then(async () => {
+      if (disposed) return;
       const initial = await invoke<AppSnapshot>("get_snapshot");
       if (!disposed && !receivedEvent) setSnapshot(initial);
     }).catch((error) => { if (!disposed) setNotice(String(error)); });
-    return () => { disposed = true; unlisten?.(); };
+    return () => { disposed = true; unsubscribers.forEach((fn) => fn()); };
   }, []);
 
   const counts = useMemo(() => snapshot.jobs.reduce((acc, job) => {
@@ -146,7 +156,15 @@ function EmptyState() {
 }
 
 function JobRow({ job, run }: { job: DownloadJob; run: (command: string, args?: Record<string, unknown>) => Promise<void> }) {
-  const [details, setDetails] = useState(false);
+  const [details, setDetails] = useState<string | null>(null);
+  async function toggleDetails() {
+    if (details !== null) {
+      setDetails(null);
+      return;
+    }
+    try { setDetails(await invoke<string>("get_job_details", { id: job.id })); }
+    catch (error) { setDetails(String(error)); }
+  }
   const active = ["starting", "downloading", "merging"].includes(job.status);
   const subtitle = job.status === "downloading"
     ? progressText(job)
@@ -165,13 +183,13 @@ function JobRow({ job, run }: { job: DownloadJob; run: (command: string, args?: 
       <div className="job-actions">
         {active && <button onClick={() => run("cancel_job", { id: job.id })}><X size={14} /> Cancel</button>}
         {job.status === "waiting" && <button onClick={() => run("cancel_job", { id: job.id })}><X size={14} /> Remove</button>}
-        {(job.status === "failed" || job.status === "cancelled") && <button onClick={() => run("retry_job", { id: job.id })}><RotateCcw size={14} /> Retry</button>}
-        {job.status === "completed" && <button onClick={() => run("open_download_folder")}><FolderOpen size={14} /> Show</button>}
-        {["completed", "failed", "cancelled"].includes(job.status) && <button className="icon-only" aria-label="Remove from list" onClick={() => run("remove_job", { id: job.id })}><Trash2 size={14} /></button>}
-        {job.details && <button onClick={() => setDetails(!details)}>{details ? <ChevronUp size={14} /> : <ChevronDown size={14} />} Details</button>}
+        {["failed", "cancelled", "interrupted"].includes(job.status) && <button onClick={() => run("retry_job", { id: job.id })}><RotateCcw size={14} /> {job.status === "interrupted" ? "Resume" : "Retry"}</button>}
+        {job.status === "completed" && job.filename && <button onClick={() => run("reveal_download", { id: job.id })}><FolderOpen size={14} /> Reveal file</button>}
+        {["completed", "failed", "cancelled", "interrupted"].includes(job.status) && <button className="icon-only" aria-label="Remove from list" onClick={() => run("remove_job", { id: job.id })}><Trash2 size={14} /></button>}
+        {job.has_details && <button aria-expanded={details !== null} onClick={() => void toggleDetails()}>{details !== null ? <ChevronUp size={14} /> : <ChevronDown size={14} />} Details</button>}
       </div>
     </div>
-    {details && <pre>{job.details}</pre>}
+    {job.has_details && details !== null && <pre>{details}</pre>}
   </article>;
 }
 
@@ -180,15 +198,26 @@ function SettingsPanel({ snapshot, close, updateSettings, run, setNotice }: {
   run: (command: string, args?: Record<string, unknown>) => Promise<void>; setNotice: (value: string | null) => void;
 }) {
   const [updating, setUpdating] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [setupMessage, setSetupMessage] = useState<string | null>(null);
+  async function checkSetup() {
+    setChecking(true);
+    try {
+      await invoke("check_setup");
+      setSetupMessage("Setup checked. Review the tool status below.");
+    } catch (error) { setSetupMessage(String(error)); }
+    finally { setChecking(false); }
+  }
   async function updateYtdlp() {
     setUpdating(true);
-    try { const message = await invoke<string>("update_ytdlp"); setNotice(message); }
-    catch (error) { setNotice(String(error)); }
+    setSetupMessage("Downloading and verifying yt-dlp…");
+    try { const message = await invoke<string>("update_ytdlp"); setSetupMessage(message); setNotice(message); }
+    catch (error) { setSetupMessage(String(error)); }
     finally { setUpdating(false); }
   }
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close(); }}>
-    <aside className="settings-panel">
-      <div className="settings-title"><div><h2>Settings</h2><p>Just the essentials.</p></div><button className="icon-button" onClick={close}><X size={19} /></button></div>
+    <aside className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" onKeyDown={(event) => { if (event.key === "Escape") close(); }}>
+      <div className="settings-title"><div><h2 id="settings-title">Settings</h2><p>Just the essentials.</p></div><button className="icon-button" aria-label="Close settings" onClick={close}><X size={19} /></button></div>
       <div className="settings-group">
         <h3>Downloads</h3>
         <label><span><strong>Download folder</strong><small title={snapshot.settings.download_dir}>{snapshot.settings.download_dir}</small></span><button onClick={() => run("choose_download_folder")}>Change</button></label>
@@ -205,12 +234,16 @@ function SettingsPanel({ snapshot, close, updateSettings, run, setNotice }: {
         <DependencyRow name="yt-dlp" available={!!snapshot.dependencies.ytdlp_path} detail={snapshot.dependencies.ytdlp_version ? `${snapshot.dependencies.ytdlp_version}${snapshot.dependencies.ytdlp_managed ? " • managed by QuickFetch" : " • system"}` : "Not found"} />
         <DependencyRow name="FFmpeg" available={!!snapshot.dependencies.ffmpeg_path} detail={snapshot.dependencies.ffmpeg_version ?? "Not found — required to merge audio and video"} />
         <DependencyRow name="FFprobe" available={!!snapshot.dependencies.ffprobe_path} detail={snapshot.dependencies.ffprobe_version ?? "Not found — required to validate output media"} />
+        <DependencyRow name="Deno" available={!!snapshot.dependencies.deno_path} detail={snapshot.dependencies.deno_version ?? "Install Deno 2.3 or newer for full YouTube support"} />
         <div className="settings-buttons">
-          <button onClick={updateYtdlp} disabled={updating}>{updating && <LoaderCircle className="spin" size={14} />}{snapshot.dependencies.ytdlp_path ? "Check yt-dlp update" : "Install yt-dlp"}</button>
-          {!snapshot.dependencies.ffmpeg_path && <button onClick={() => run("open_ffmpeg_help")}><ExternalLink size={14} /> Get FFmpeg</button>}
+          <button onClick={checkSetup} disabled={checking || updating}>{checking ? "Checking…" : "Check setup"}</button>
+          <button onClick={updateYtdlp} disabled={updating}>{updating && <LoaderCircle className="spin" size={14} />}{snapshot.dependencies.ytdlp_managed ? "Update managed yt-dlp" : "Install managed yt-dlp"}</button>
+          {(!snapshot.dependencies.ffmpeg_path || !snapshot.dependencies.ffprobe_path) && <button onClick={() => run("open_ffmpeg_help")}><ExternalLink size={14} /> Get FFmpeg</button>}
+          {!snapshot.dependencies.deno_path && <button onClick={() => run("open_deno_help")}><ExternalLink size={14} /> Get Deno</button>}
         </div>
+        {setupMessage && <p className="setup-message" role="status">{setupMessage}</p>}
       </div>
-      <footer>QuickFetch 0.1.0 · Local, private, and focused.</footer>
+      <footer>QuickFetch 0.1.1 · Local, private, and focused.</footer>
     </aside>
   </div>;
 }

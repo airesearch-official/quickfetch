@@ -1,5 +1,7 @@
 # Hardening work
 
+This file records the v0.1.0 work. For the current repository review and subsequent improvements, see [docs/AUDIT.md](docs/AUDIT.md) and [CHANGELOG.md](CHANGELOG.md).
+
 ## Completed changes
 
 - Baseline repository initialized at `18e6794` with secret, cookie, download and build exclusions.

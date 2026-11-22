@@ -78,7 +78,9 @@ textarea:focus { border-color: #3382eb; box-shadow: 0 0 0 3px rgba(23,107,223,.1
 .dependency-ok, .dependency-missing { display: grid; flex: none; place-items: center; width: 25px; height: 25px; border-radius: 8px; }
 .dependency-ok { color: #16834c; background: #e4f6eb; }
 .dependency-missing { color: #b4443e; background: #fce9e7; }
-.settings-buttons { display: flex; gap: 7px; margin-top: 9px; }
+.settings-buttons { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+.settings-group > p { margin: 8px 0 12px; color: #73808e; font-size: 12px; line-height: 1.5; }
+.setup-message { margin-top: 12px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .settings-panel footer { padding-top: 18px; border-top: 1px solid #e3e7eb; color: #919ba4; font-size: 10.5px; }
 .spin { animation: spin .9s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
